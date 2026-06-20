@@ -14,7 +14,7 @@
 use derive_more::Into;
 use log::debug;
 use serde::Deserialize;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::ops::Deref;
 use thiserror::Error;
 
@@ -31,7 +31,7 @@ impl SqlitePool {
         let connect_options =
             SqliteConnectOptions::try_from(config).map_err(Error::ConvertConfig)?;
         let inner = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(8)
             .connect_with(connect_options)
             .await?;
         let pool = SqlitePool(inner);
@@ -70,7 +70,17 @@ impl TryFrom<Config> for SqliteConnectOptions {
 
     fn try_from(config: Config) -> Result<Self, Self::Error> {
         let mut options = config.cnn_url.parse::<SqliteConnectOptions>()?;
-        options = options.create_if_missing(true);
+        options = options
+            .create_if_missing(true)
+            // WAL allows concurrent readers alongside a single writer. Required
+            // because the shared pool hands connections to multiple sub-indexers
+            // (chain/spo/wallet/api) that read and write concurrently; the default
+            // rollback journal deadlocks on shared->exclusive lock upgrades and
+            // returns SQLITE_BUSY immediately, bypassing busy_timeout.
+            .journal_mode(SqliteJournalMode::Wal)
+            // Let a contending writer wait for the WAL write lock instead of
+            // failing fast with SQLITE_BUSY.
+            .busy_timeout(std::time::Duration::from_secs(30));
         Ok(options)
     }
 }

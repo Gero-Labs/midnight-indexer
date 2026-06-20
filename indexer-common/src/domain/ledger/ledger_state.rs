@@ -69,6 +69,12 @@ const OUTPUT_INDEX_ZERO: u32 = 0;
 static STRICTNESS_V8: LazyLock<WellFormedStrictnessV8> = LazyLock::new(|| {
     let mut strictness = WellFormedStrictnessV8::default();
     strictness.enforce_balancing = false;
+    // Trust the local full node: it already verified every block's ZK proofs before
+    // finalizing it, so re-verifying here is pure redundant work (the catch-up
+    // bottleneck). Skip the expensive native/contract proof checks; signatures + limits
+    // stay enforced. ONLY valid when indexing from a trusted, validating node.
+    strictness.verify_native_proofs = false;
+    strictness.verify_contract_proofs = false;
     strictness
 });
 
