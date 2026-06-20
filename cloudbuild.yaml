@@ -1,0 +1,18 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=RUST_VERSION=1.95.0
+      - -f
+      - indexer-standalone/Dockerfile
+      - -t
+      - europe-west3-docker.pkg.dev/emerald-result-490621-p2/gero/midnight-indexer-standalone:${_TAG}
+      - .
+images:
+  - europe-west3-docker.pkg.dev/emerald-result-490621-p2/gero/midnight-indexer-standalone:${_TAG}
+substitutions:
+  _TAG: '4.3.3-trustnode2'
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 100
+timeout: 3600s
