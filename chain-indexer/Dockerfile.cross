@@ -1,0 +1,37 @@
+# Cross-build of chain-indexer for linux/amd64 from an arm64 host (QEMU segfaults rustc).
+# Builder runs natively ($BUILDPLATFORM) and targets x86_64-unknown-linux-gnu; the runtime stage
+# matches chain-indexer/Dockerfile. Build: docker buildx build --platform linux/amd64 -f chain-indexer/Dockerfile.cross --build-arg RUST_VERSION=1.95.0 .
+ARG RUST_VERSION
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-trixie AS builder
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross cmake clang && \
+    rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-gnu
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+    CARGO_BUILD_JOBS=6
+WORKDIR /build
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build -p chain-indexer --locked --features cloud --release --target x86_64-unknown-linux-gnu && \
+    mkdir -p /runtime/usr/local/bin /runtime/opt/chain-indexer && \
+    cp target/x86_64-unknown-linux-gnu/release/chain-indexer /runtime/usr/local/bin/ && \
+    cp chain-indexer/bin/entrypoint.sh /runtime/usr/local/bin/ && \
+    cp chain-indexer/config.yaml /runtime/opt/chain-indexer/
+
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS runtime
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates=20250419 && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd -u 10001 -d /nonexistent -s /usr/sbin/nologin -M -c "" appuser && \
+    passwd -l appuser && \
+    mkdir /var/run/chain-indexer && \
+    chown appuser:appuser /var/run/chain-indexer
+COPY --from=builder --chown=appuser:appuser /runtime /
+USER appuser
+WORKDIR /opt/chain-indexer
+ENTRYPOINT ["entrypoint.sh"]
