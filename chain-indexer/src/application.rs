@@ -32,7 +32,7 @@ use log::{debug, info, warn};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::{
-    collections::HashSet, error::Error as StdError, future::ready, pin::pin, sync::Arc,
+    collections::HashSet, error::Error as StdError, pin::pin, sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -153,8 +153,29 @@ pub async fn run(
         let node = node.clone();
 
         async move {
+            // Fetch each block's system parameters from the node ahead of indexing, up to
+            // `blocks_buffer` blocks at a time. They depend only on the block's own state, not on
+            // anything the indexer has stored, and `buffered` yields in order, so indexing still
+            // sees blocks in sequence; only the node round trips overlap.
             let blocks = node_blocks(highest_block_ref, node.clone())
-                .map(ready)
+                .map(|block| {
+                    let node = node.clone();
+                    async move {
+                        match block {
+                            Ok(block) => node
+                                .fetch_system_parameters(
+                                    block.hash,
+                                    block.height,
+                                    block.timestamp,
+                                    block.protocol_version.node_version(),
+                                )
+                                .await
+                                .map(|system_parameters| (block, system_parameters)),
+
+                            Err(error) => Err(error),
+                        }
+                    }
+                })
                 .buffered(blocks_buffer);
             let mut blocks = pin!(blocks);
             let mut caught_up = false;
@@ -259,7 +280,7 @@ where
 async fn get_and_index_block<E, N>(
     caught_up_max_distance: u32,
     caught_up_leeway: u32,
-    blocks: &mut (impl Stream<Item = Result<node::Block, E>> + Unpin),
+    blocks: &mut (impl Stream<Item = Result<(node::Block, SystemParametersChange), E>> + Unpin),
     ledger_state: LedgerState,
     highest_block_on_node: &Arc<RwLock<Option<BlockRef>>>,
     caught_up: &mut bool,
@@ -273,12 +294,13 @@ where
     E: StdError + Send + Sync + 'static,
     N: Node,
 {
-    let block = get_next_block(blocks).await?;
+    let (block, system_parameters) = get_next_block(blocks).await?;
 
     let ledger_state = index_block(
         caught_up_max_distance,
         caught_up_leeway,
         block,
+        system_parameters,
         ledger_state,
         highest_block_on_node,
         caught_up,
@@ -295,8 +317,8 @@ where
 
 #[trace]
 async fn get_next_block<E>(
-    blocks: &mut (impl Stream<Item = Result<node::Block, E>> + Unpin),
-) -> anyhow::Result<node::Block>
+    blocks: &mut (impl Stream<Item = Result<(node::Block, SystemParametersChange), E>> + Unpin),
+) -> anyhow::Result<(node::Block, SystemParametersChange)>
 where
     E: StdError + Send + Sync + 'static,
 {
@@ -313,6 +335,7 @@ async fn index_block<N>(
     caught_up_max_distance: u32,
     caught_up_leeway: u32,
     block: node::Block,
+    system_parameters: SystemParametersChange,
     mut ledger_state: LedgerState,
     highest_block_on_node: &Arc<RwLock<Option<BlockRef>>>,
     caught_up: &mut bool,
@@ -455,9 +478,10 @@ where
     ledger_state = new_ledger_state.into();
 
     // Determine system parameters change if any.
-    let system_parameters_change = determine_system_parameters_change(&block, storage, node)
-        .await
-        .context("determine system parameters change")?;
+    let system_parameters_change =
+        determine_system_parameters_change(&block, system_parameters, storage)
+            .await
+            .context("determine system parameters change")?;
 
     // Save the block with its related data and system parameters atomically.
     let max_transaction_id = storage
@@ -519,27 +543,13 @@ where
     Ok(ledger_state)
 }
 
-/// Fetch system parameters from the node and determine if they changed.
+/// Determine if the block's system parameters, prefetched from the node, changed.
 #[trace]
-async fn determine_system_parameters_change<N>(
+async fn determine_system_parameters_change(
     block: &Block,
+    current: SystemParametersChange,
     storage: &mut impl Storage,
-    node: &N,
-) -> anyhow::Result<Option<SystemParametersChange>>
-where
-    N: Node,
-{
-    // Fetch current system parameters from the node.
-    let current = node
-        .fetch_system_parameters(
-            block.hash,
-            block.height,
-            block.timestamp,
-            block.protocol_version.node_version(),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("fetch system parameters: {error}"))?;
-
+) -> anyhow::Result<Option<SystemParametersChange>> {
     // Get the latest stored parameters.
     let stored_d_param = storage
         .get_latest_d_parameter()
