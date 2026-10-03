@@ -17,6 +17,7 @@ use fastrace::trace;
 use indexer_common::domain::{
     ApplyRegularTransactionOutcome, ApplySystemTransactionOutcome, BlockHash, LedgerVersion,
     NetworkId, SerializedContractAddress, SerializedLedgerStateKey, TransactionHash,
+    TransactionResult,
     ledger::{self, LedgerParameters},
 };
 use log::warn;
@@ -72,11 +73,11 @@ impl LedgerState {
     /// Apply the given node transactions to this ledger state and return domain transactions.
     ///
     /// `bump_first_regular_tblock` selects whether the node's mempool-cached validity result is
-    /// reproduced for the first regular transaction (see below). It must be `false` for the genesis
-    /// block (height 0): the transactions embedded in genesis never transited the mempool, so the
-    /// node never cached a bumped result for them and validated them against the real block time.
-    /// Bumping them would push the well-formed `tblock` past a bootstrap transaction's intent TTL
-    /// and wrongly reject it.
+    /// reproduced for the regular transactions before the first one that applies (see below). It
+    /// must be `false` for the genesis block (height 0): the transactions embedded in genesis
+    /// never transited the mempool, so the node never cached a bumped result for them and
+    /// validated them against the real block time. Bumping them would push the well-formed
+    /// `tblock` past a bootstrap transaction's intent TTL and wrongly reject it.
     #[trace(properties = { "parent_block_hash": "{parent_block_hash}" })]
     pub fn apply_transactions(
         &mut self,
@@ -86,40 +87,41 @@ impl LedgerState {
         parent_block_timestamp: u64,
         bump_first_regular_tblock: bool,
     ) -> Result<(Vec<Transaction>, LedgerParameters), Error> {
-        // The node validates a mempool transaction against a `tblock` bumped two slots ahead of the
-        // *parent* (last produced) block's time, then caches the well-formed result keyed on
-        // (tx_hash, ledger_state_key). At block inclusion only the first regular transaction still
-        // matches that key, so the node reuses the cached (bumped) validity result and skips
-        // re-checking it against the real block time; later transactions get a fresh check against
-        // block time. The bump base is the parent block time (`get_block_context().tblock` during
-        // pool validation still holds the last produced block's timestamp; see the node's
-        // `pallet-midnight` `validate_unsigned`), NOT the current block time — bumping from the
-        // current block overshoots by the inter-block gap and can push `tblock` past a
-        // transaction's intent TTL, wrongly rejecting a tx the node accepted.
+        // The node validates a pool transaction at the parent block time plus two slots (see its
+        // `pallet-midnight` `validate_unsigned`) and caches the result keyed on the ledger state.
+        // At inclusion the cache hits only while the state is still the parent's, i.e. before a
+        // regular transaction applies (a failed one leaves the state unchanged), so such a
+        // transaction is verified at that bumped `tblock` and later ones at the block time. The
+        // base is the parent time, not the block time: bumping from the block overshoots by the
+        // inter-block gap.
         //
-        // Reproduce that by bumping only the first regular transaction's well-formed `tblock` off
-        // the parent block time. `apply` always runs against the real block time, so the resulting
-        // state matches the node.
-        let mut first_regular_transaction = true;
+        // The cache misses if the author validated the transaction against an older state, and
+        // the block does not record which (mainnet block 1788980, preprod block 164460). So, like
+        // midnightntwrk/midnight-indexer#1610 and the node (midnightntwrk/midnight-node#2216),
+        // verify at the block time and, if malformed there, at the bumped `tblock`. `apply` always
+        // runs at the block time, so the state matches the node.
+        let mut no_regular_transaction_applied = true;
         let transactions = transactions
             .into_iter()
             .map(|transaction| match transaction {
                 node::Transaction::Regular(transaction) => {
-                    let well_formed_timestamp =
-                        if first_regular_transaction && bump_first_regular_tblock {
-                            parent_block_timestamp + MEMPOOL_TBLOCK_BUMP_MILLIS
-                        } else {
-                            block_timestamp
-                        };
-                    first_regular_transaction = false;
+                    let well_formed_timestamp = (no_regular_transaction_applied
+                        && bump_first_regular_tblock)
+                        .then_some(parent_block_timestamp + MEMPOOL_TBLOCK_BUMP_MILLIS);
 
-                    self.apply_regular_transaction(
+                    let transaction = self.apply_regular_transaction(
                         transaction,
                         parent_block_hash,
                         block_timestamp,
                         parent_block_timestamp,
                         well_formed_timestamp,
-                    )
+                    )?;
+                    if let Transaction::Regular(transaction) = &transaction {
+                        no_regular_transaction_applied &=
+                            transaction.transaction_result == TransactionResult::Failure;
+                    }
+
+                    Ok(transaction)
                 }
 
                 node::Transaction::System(transaction) => {
@@ -143,7 +145,7 @@ impl LedgerState {
     #[trace(properties = {
         "parent_block_hash": "{parent_block_hash}",
         "block_timestamp": "{block_timestamp}",
-        "well_formed_timestamp": "{well_formed_timestamp}"
+        "well_formed_timestamp": "{well_formed_timestamp:?}"
     })]
     fn apply_regular_transaction(
         &mut self,
@@ -151,7 +153,7 @@ impl LedgerState {
         parent_block_hash: BlockHash,
         block_timestamp: u64,
         parent_block_timestamp: u64,
-        well_formed_timestamp: u64,
+        well_formed_timestamp: Option<u64>,
     ) -> Result<Transaction, Error> {
         let mut transaction = RegularTransaction::from(transaction);
 
@@ -165,46 +167,41 @@ impl LedgerState {
             spent_unshielded_utxos,
             ledger_events,
             fees,
-        } = self
-            .0
-            .apply_regular_transaction(
-                &transaction.raw,
-                parent_block_hash,
-                block_timestamp,
-                parent_block_timestamp,
-                well_formed_timestamp,
-            )
-            .or_else(|error| match error {
-                // The bumped `tblock` is only what the node used when its mempool cache was warm;
-                // with a cold cache it validated the transaction at block time instead, and nothing
-                // in the block records which. Mainnet block 1788980 and preprod block 164460 hold
-                // first transactions whose intent TTL lies between block time and the bumped
-                // `tblock`. So, like the node (midnightntwrk/midnight-node#2216) and upstream
-                // (midnightntwrk/midnight-indexer#1610), accept the transaction if it is
-                // well-formed at either `tblock`. `well_formed` fails before the ledger state is
-                // touched, so retrying is safe, and `apply` always runs at block time.
-                ledger::Error::MalformedTransaction(_)
-                    if well_formed_timestamp != block_timestamp =>
-                {
+        } = {
+            let mut apply = |well_formed_timestamp| {
+                self.0.apply_regular_transaction(
+                    &transaction.raw,
+                    parent_block_hash,
+                    block_timestamp,
+                    parent_block_timestamp,
+                    well_formed_timestamp,
+                )
+            };
+
+            // Verify at the block time and, if malformed there, at `well_formed_timestamp`. A
+            // malformed transaction leaves the ledger state untouched (`well_formed` fails before
+            // `apply`), so the retry applies to the same state. The error reported is the one at
+            // block time.
+            match (apply(block_timestamp), well_formed_timestamp) {
+                (
+                    Err(error @ ledger::Error::MalformedTransaction(_)),
+                    Some(well_formed_timestamp),
+                ) => apply(well_formed_timestamp).map_err(|retry_error| {
                     warn!(
                         transaction_hash:% = transaction.hash,
+                        parent_block_hash:%,
                         block_timestamp,
                         well_formed_timestamp,
-                        error:%;
-                        "first regular transaction malformed at bumped tblock, retrying at block time"
+                        retry_error:%;
+                        "regular transaction malformed at the bumped tblock as well"
                     );
-                    self.0.apply_regular_transaction(
-                        &transaction.raw,
-                        parent_block_hash,
-                        block_timestamp,
-                        parent_block_timestamp,
-                        block_timestamp,
-                    )
-                }
+                    error
+                }),
 
-                error => Err(error),
-            })
-            .map_err(|error| Error::ApplyRegularTransaction(Some(transaction.hash), error))?;
+                (outcome, _) => outcome,
+            }
+        }
+        .map_err(|error| Error::ApplyRegularTransaction(Some(transaction.hash), error))?;
 
         // Update transaction.
         transaction.transaction_result = transaction_result;
@@ -348,14 +345,185 @@ mod tests {
     use crate::domain::{LedgerState, Transaction, node};
     use anyhow::Context;
     use indexer_common::{
-        domain::{BlockHash, ProtocolVersion, SerializedTransaction, TransactionHash, ledger},
+        domain::{
+            BlockHash, LedgerVersion, ProtocolVersion, SerializedTransaction, TransactionHash,
+            TransactionResult,
+            ledger::{self, TaggedSerializableExt},
+        },
         error::BoxError,
         infra::{
-            ledger_db, migrations,
+            ledger_db::{self, v1_1::LedgerDb},
+            migrations,
             pool::{self, sqlite::SqlitePool},
         },
     };
+    use midnight_base_crypto_v1::{
+        signatures::{Signature, SigningKey},
+        time::Timestamp,
+    };
+    use midnight_ledger_v8::{
+        dust::{DustActions, DustPublicKey, DustRegistration, DustSecretKey},
+        error::{MalformedTransaction, TransactionApplicationError},
+        structure::{Intent, ProofPreimageMarker, Transaction as LedgerTransaction},
+    };
+    use midnight_onchain_runtime_v3::cost_model::INITIAL_COST_MODEL;
+    use midnight_storage_core_v1::arena::Sp;
+    use midnight_transient_crypto_v2::{
+        commitment::PedersenRandomness,
+        curve::Fr,
+        proofs::{Proof, ProofPreimage, ProvingProvider},
+    };
+    use rand::{SeedableRng, rngs::StdRng};
     use std::{error::Error as StdError, fs, iter};
+
+    // Network ID of the synthetic transactions.
+    const NETWORK_ID: &str = "undeployed";
+
+    // Block time of every synthetic test block, in seconds. Each case sets its parent block time
+    // relative to it, and the bumped `tblock` is `parent + 12s`.
+    const NOW: u64 = 1_800_000_000;
+
+    // A reason the ledger rejects a transaction as malformed.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Malformed {
+        IntentTtlExpired,
+        OutOfDustValidityWindow,
+        // Any other malformed-transaction error, as displayed.
+        Other(String),
+    }
+
+    // One block applied at `NOW` to a fresh ledger state. Times are in seconds.
+    struct Case {
+        name: &'static str,
+        // Intent TTL and dust `ctime` of each regular transaction.
+        transactions: &'static [(u64, u64)],
+        parent_block_time: u64,
+        bump_first_regular_tblock: bool,
+        expected: Result<Vec<TransactionResult>, Malformed>,
+    }
+
+    // Ported from midnightntwrk/midnight-indexer#1610 (ledger 8 only): a regular transaction is
+    // accepted if well-formed at the block time or at the bumped `tblock` until one applies; from
+    // then on only at the block time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regular_transactions_are_accepted_at_the_bumped_tblock_until_one_applies()
+    -> Result<(), BoxError> {
+        use Malformed::{IntentTtlExpired, OutOfDustValidityWindow};
+        use TransactionResult::{Failure, Success};
+
+        let _temp_dir = init_ledger_db().await?;
+        let protocol_version = ProtocolVersion::V1_0(1_000_000);
+
+        let cases = [
+            // With the parent block in the previous 6s slot the bumped `tblock` is `NOW + 6s`. A
+            // dust `ctime` of `NOW + 4s` is valid there but not at the block time, and only the
+            // transactions before the first applied one are retried there.
+            Case {
+                name: "dust ctime ahead, bumped",
+                transactions: &[(NOW + 60, NOW + 4)],
+                parent_block_time: NOW - 6,
+                bump_first_regular_tblock: true,
+                expected: Ok(vec![Success]),
+            },
+            Case {
+                name: "dust ctime ahead, not bumped",
+                transactions: &[(NOW + 60, NOW + 4)],
+                parent_block_time: NOW - 6,
+                bump_first_regular_tblock: false,
+                expected: Err(OutOfDustValidityWindow),
+            },
+            Case {
+                name: "dust ctime ahead, second transaction",
+                transactions: &[(NOW + 60, NOW), (NOW + 60, NOW + 4)],
+                parent_block_time: NOW - 6,
+                bump_first_regular_tblock: true,
+                expected: Err(OutOfDustValidityWindow),
+            },
+            // `NOW + 6s` is past an intent TTL of `NOW + 2s`; the block time is not.
+            Case {
+                name: "ttl before bumped tblock, bumped",
+                transactions: &[(NOW + 2, NOW)],
+                parent_block_time: NOW - 6,
+                bump_first_regular_tblock: true,
+                expected: Ok(vec![Success]),
+            },
+            // With the two slots before the block skipped the bumped `tblock` is `NOW - 6s`,
+            // before the block time. An intent TTL of `NOW - 5s` passes `well_formed` there, and
+            // `apply` fails it at the block time.
+            Case {
+                name: "ttl before block time, bumped",
+                transactions: &[(NOW - 5, NOW - 18)],
+                parent_block_time: NOW - 18,
+                bump_first_regular_tblock: true,
+                expected: Ok(vec![Failure]),
+            },
+            Case {
+                name: "ttl before block time, not bumped",
+                transactions: &[(NOW - 5, NOW - 18)],
+                parent_block_time: NOW - 18,
+                bump_first_regular_tblock: false,
+                expected: Err(IntentTtlExpired),
+            },
+            // A dust `ctime` of `NOW - 5s` is past `NOW - 6s` but valid at the block time.
+            Case {
+                name: "dust ctime after bumped tblock, bumped",
+                transactions: &[(NOW + 40, NOW - 5)],
+                parent_block_time: NOW - 18,
+                bump_first_regular_tblock: true,
+                expected: Ok(vec![Success]),
+            },
+            // Malformed at both `tblock`s, with a different error at each: the error at the block
+            // time is reported.
+            Case {
+                name: "malformed at both, bumped tblock after the block time",
+                transactions: &[(NOW + 2, NOW + 4)],
+                parent_block_time: NOW - 6,
+                bump_first_regular_tblock: true,
+                expected: Err(OutOfDustValidityWindow),
+            },
+            Case {
+                name: "malformed at both, bumped tblock before the block time",
+                transactions: &[(NOW - 5, NOW - 5)],
+                parent_block_time: NOW - 18,
+                bump_first_regular_tblock: true,
+                expected: Err(IntentTtlExpired),
+            },
+            // A failed regular transaction leaves the state unchanged, so the next one is still
+            // verified at the bumped `tblock` `NOW - 6s`: an intent TTL of `NOW - 3s` passes
+            // `well_formed` there, and `apply` fails it at the block time as well. This is the
+            // case catchup.4 (first transaction only) got wrong.
+            Case {
+                name: "ttl before block time, after a failed transaction",
+                transactions: &[(NOW - 5, NOW - 18), (NOW - 3, NOW - 18)],
+                parent_block_time: NOW - 18,
+                bump_first_regular_tblock: true,
+                expected: Ok(vec![Failure, Failure]),
+            },
+        ];
+
+        for case in cases {
+            let mut transactions = vec![];
+            for &(ttl, ctime) in case.transactions {
+                transactions.push(dust_registration(ttl, ctime).await?);
+            }
+
+            assert_eq!(
+                apply(
+                    NETWORK_ID,
+                    protocol_version,
+                    &transactions,
+                    NOW,
+                    case.parent_block_time,
+                    case.bump_first_regular_tblock,
+                )?,
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+
+        Ok(())
+    }
 
     // Mainnet block 1788980's first (and only) regular transaction: parent 1784643552, block
     // 1784643558, intent TTL 1784643562. The node accepted it at block time; the bumped `tblock`
@@ -363,18 +531,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn mainnet_1788980_ttl_between_the_tblocks_is_accepted() -> Result<(), BoxError> {
         let _temp_dir = init_ledger_db().await?;
-        let error = apply_one(
-            "mainnet",
-            ProtocolVersion::V1_0(1_000_000),
+        let transaction = fixture(
             "block_1788980_tx.raw",
             "e769b82781bbfd1e29d602a17916abe6e967ef023eb94d23a4aa8b88a6e35c0a",
-            1_784_643_558,
-            1_784_643_552,
         )?;
 
         // Against a fresh state instead of mainnet's, the transaction passes the time checks and
         // fails the next stateful check: the contract it calls does not exist.
-        assert!(error.contains("call to non-existant contract"), "{error}");
+        assert_eq!(
+            apply(
+                "mainnet",
+                ProtocolVersion::V1_0(1_000_000),
+                &[transaction],
+                1_784_643_558,
+                1_784_643_552,
+                true,
+            )?,
+            Err(Malformed::Other(
+                "call to non-existant contract ContractAddress(4fd31443997bd04bbf0b94e2ef3d5b0ff05479c4fb80bcac0dc74b2c763282e5)"
+                    .to_string()
+            ))
+        );
         Ok(())
     }
 
@@ -383,75 +560,153 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn preprod_164460_ttl_between_the_tblocks_is_accepted() -> Result<(), BoxError> {
         let _temp_dir = init_ledger_db().await?;
-        let error = apply_one(
-            "preprod",
-            ProtocolVersion::V0_22(22_000),
+        let transaction = fixture(
             "block_164460_tx.raw",
             "6a1005eecf695a8f950e8f8e74de0c6336daf55448326bf0db0b3b55c089ad0b",
-            1_775_081_616,
-            1_775_081_610,
         )?;
 
-        assert!(error.contains("call to non-existant contract"), "{error}");
+        assert_eq!(
+            apply(
+                "preprod",
+                ProtocolVersion::V0_22(22_000),
+                &[transaction],
+                1_775_081_616,
+                1_775_081_610,
+                true,
+            )?,
+            Err(Malformed::Other(
+                "call to non-existant contract ContractAddress(18835f54e98cfbf5c789ef76fb79d4cb0e8d84d627ef1e36cdf27cf3cdbaebb7)"
+                    .to_string()
+            ))
+        );
         Ok(())
     }
 
-    // Applies one fixture transaction as the first regular transaction of a block, with the bump,
-    // to a fresh ledger state and returns the rejection error. Times are in seconds.
-    fn apply_one(
+    // Applies `transactions` as one block to a fresh ledger state of `network_id`; the outer error
+    // is a test setup failure, the inner one the reason the ledger rejects a transaction. Times
+    // are in seconds.
+    fn apply(
         network_id: &str,
         protocol_version: ProtocolVersion,
-        file_name: &str,
-        hash: &str,
+        transactions: &[SerializedTransaction],
         block_time: u64,
         parent_block_time: u64,
-    ) -> Result<String, BoxError> {
+        bump_first_regular_tblock: bool,
+    ) -> Result<Result<Vec<TransactionResult>, Malformed>, BoxError> {
         let ledger_version = protocol_version.ledger_version();
+        let mut ledger_state = LedgerState::new(network_id.try_into()?, ledger_version)?;
+        let transactions = transactions
+            .iter()
+            .map(|raw| {
+                let transaction = ledger::Transaction::deserialize(raw, ledger_version)?;
+                Ok(node::Transaction::Regular(node::RegularTransaction {
+                    hash: transaction.hash(),
+                    protocol_version,
+                    raw: raw.clone(),
+                    identifiers: transaction.identifiers()?,
+                    contract_actions: vec![],
+                }))
+            })
+            .collect::<Result<Vec<_>, BoxError>>()?;
+
+        match ledger_state.apply_transactions(
+            transactions,
+            BlockHash::from([0; 32]),
+            block_time * 1_000,
+            parent_block_time * 1_000,
+            bump_first_regular_tblock,
+        ) {
+            Ok((transactions, _)) => Ok(Ok(transactions
+                .into_iter()
+                .filter_map(|transaction| match transaction {
+                    Transaction::Regular(transaction) => Some(transaction.transaction_result),
+                    Transaction::System(_) => None,
+                })
+                .collect())),
+            Err(error) => malformed(&error)
+                .map(Err)
+                .ok_or_else(|| format!("unexpected error: {error}").into()),
+        }
+    }
+
+    // Returns why the ledger rejected a transaction as malformed, if `error` or any of its sources
+    // reports it.
+    fn malformed(error: &(dyn StdError + 'static)) -> Option<Malformed> {
+        iter::successors(Some(error), |&error| error.source()).find_map(|error| {
+            error.downcast_ref::<MalformedTransaction<LedgerDb>>().map(
+                |malformed| match malformed {
+                    MalformedTransaction::TransactionApplicationError(
+                        TransactionApplicationError::IntentTtlExpired(..),
+                    ) => Malformed::IntentTtlExpired,
+                    MalformedTransaction::OutOfDustValidityWindow { .. } => {
+                        Malformed::OutOfDustValidityWindow
+                    }
+                    other => Malformed::Other(other.to_string()),
+                },
+            )
+        })
+    }
+
+    // Builds a serialized ledger-8 transaction whose single intent carries only a signed dust
+    // registration. It needs no proofs, so it applies to a fresh ledger state for [NETWORK_ID].
+    // Times are in seconds. Ported from midnightntwrk/midnight-indexer#1610.
+    async fn dust_registration(
+        ttl: u64,
+        dust_ctime: u64,
+    ) -> Result<SerializedTransaction, BoxError> {
+        let mut rng = StdRng::seed_from_u64(0);
+        let night_key = SigningKey::sample(&mut rng);
+        let registration = DustRegistration {
+            night_key: night_key.verifying_key(),
+            dust_address: Some(Sp::new(DustPublicKey::from(DustSecretKey::sample(
+                &mut rng,
+            )))),
+            allow_fee_payment: 0,
+            signature: None,
+        };
+        let dust_actions = DustActions::<Signature, ProofPreimageMarker, LedgerDb> {
+            spends: vec![].into(),
+            registrations: vec![registration].into(),
+            ctime: Timestamp::from_secs(dust_ctime),
+        };
+        let intent = Intent::<_, _, PedersenRandomness, _>::new(
+            &mut rng,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(dust_actions),
+            Timestamp::from_secs(ttl),
+        )
+        .sign(&mut rng, 1, &[], &[], &[night_key])
+        .map_err(|error| format!("sign intent: {error}"))?;
+
+        let transaction =
+            LedgerTransaction::from_intents(NETWORK_ID, [(1, intent)].into_iter().collect())
+                .prove(NoProofs, &INITIAL_COST_MODEL)
+                .await
+                .map_err(|error| format!("prove: {error}"))?
+                .seal(rng)
+                .tagged_serialize()?;
+
+        Ok(transaction)
+    }
+
+    // Reads a real ledger-8 transaction from `indexer-common/tests` and checks its hash.
+    fn fixture(file_name: &str, hash: &str) -> Result<SerializedTransaction, BoxError> {
         let raw: SerializedTransaction = fs::read(format!(
             "{}/../indexer-common/tests/{file_name}",
             env!("CARGO_MANIFEST_DIR")
         ))?
         .into();
-        let transaction = ledger::Transaction::deserialize(&raw, ledger_version)?;
-        assert_eq!(transaction.hash(), TransactionHash::from_hex(hash)?);
-
-        let transaction = node::Transaction::Regular(node::RegularTransaction {
-            hash: transaction.hash(),
-            protocol_version,
-            identifiers: transaction.identifiers()?,
-            raw,
-            contract_actions: vec![],
-        });
-
-        let mut ledger_state = LedgerState::new(network_id.try_into()?, ledger_version)?;
-        match ledger_state.apply_transactions(
-            [transaction],
-            BlockHash::from([0; 32]),
-            block_time * 1_000,
-            parent_block_time * 1_000,
-            true,
-        ) {
-            Ok((transactions, _)) => Err(format!(
-                "expected a rejection, got {:?}",
-                transactions
-                    .iter()
-                    .filter_map(|transaction| match transaction {
-                        Transaction::Regular(transaction) => Some(&transaction.transaction_result),
-                        Transaction::System(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-            )
-            .into()),
-            // Include the source chain: the ledger's reason is in the sources.
-            Err(error) => {
-                Ok(
-                    iter::successors(Some(&error as &dyn StdError), |&error| error.source())
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(": "),
-                )
-            }
-        }
+        let transaction = ledger::Transaction::deserialize(&raw, LedgerVersion::V8)?;
+        assert_eq!(
+            transaction.hash(),
+            TransactionHash::from_hex(hash)?,
+            "{file_name}"
+        );
+        Ok(raw)
     }
 
     async fn init_ledger_db() -> Result<tempfile::TempDir, BoxError> {
@@ -475,5 +730,26 @@ mod tests {
         .await
         .context("init ledger DB")?;
         Ok(temp_dir)
+    }
+
+    // A proving provider for transactions without proofs; `prove` only ever calls `split` on it.
+    struct NoProofs;
+
+    impl ProvingProvider for NoProofs {
+        async fn check(&self, _preimage: &ProofPreimage) -> anyhow::Result<Vec<Option<usize>>> {
+            unreachable!("test transactions carry no proofs")
+        }
+
+        async fn prove(
+            self,
+            _preimage: &ProofPreimage,
+            _overwrite_binding_input: Option<Fr>,
+        ) -> anyhow::Result<Proof> {
+            unreachable!("test transactions carry no proofs")
+        }
+
+        fn split(&mut self) -> Self {
+            NoProofs
+        }
     }
 }

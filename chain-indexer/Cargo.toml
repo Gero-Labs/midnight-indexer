@@ -40,6 +40,14 @@ trait-variant      = { workspace = true }
 
 [dev-dependencies]
 clap      = { workspace = true, features = [ "derive" ] }
+# Synthetic ledger-8 transactions in the tblock tests (ported from midnight-indexer#1610).
+midnight-base-crypto_v1      = { workspace = true }
+midnight-ledger_v8           = { workspace = true }
+midnight-onchain-runtime_v3  = { workspace = true }
+midnight-storage-core_v1     = { workspace = true, features = [ "layout-v2" ] }
+midnight-transient-crypto_v2 = { workspace = true }
+# midnight-ledger's `Rng`/`CryptoRng` bounds require rand 0.8.
+rand      = { version = "0.8" }
 const-hex = { workspace = true }
 criterion = { workspace = true }
 fake      = { workspace = true }
