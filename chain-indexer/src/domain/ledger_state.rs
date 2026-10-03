@@ -19,6 +19,7 @@ use indexer_common::domain::{
     NetworkId, SerializedContractAddress, SerializedLedgerStateKey, TransactionHash,
     ledger::{self, LedgerParameters},
 };
+use log::warn;
 use std::ops::DerefMut;
 use thiserror::Error;
 
@@ -173,6 +174,36 @@ impl LedgerState {
                 parent_block_timestamp,
                 well_formed_timestamp,
             )
+            .or_else(|error| match error {
+                // The bumped `tblock` is only what the node used when its mempool cache was warm;
+                // with a cold cache it validated the transaction at block time instead, and nothing
+                // in the block records which. Mainnet block 1788980 and preprod block 164460 hold
+                // first transactions whose intent TTL lies between block time and the bumped
+                // `tblock`. So, like the node (midnightntwrk/midnight-node#2216) and upstream
+                // (midnightntwrk/midnight-indexer#1610), accept the transaction if it is
+                // well-formed at either `tblock`. `well_formed` fails before the ledger state is
+                // touched, so retrying is safe, and `apply` always runs at block time.
+                ledger::Error::MalformedTransaction(_)
+                    if well_formed_timestamp != block_timestamp =>
+                {
+                    warn!(
+                        transaction_hash:% = transaction.hash,
+                        block_timestamp,
+                        well_formed_timestamp,
+                        error:%;
+                        "first regular transaction malformed at bumped tblock, retrying at block time"
+                    );
+                    self.0.apply_regular_transaction(
+                        &transaction.raw,
+                        parent_block_hash,
+                        block_timestamp,
+                        parent_block_timestamp,
+                        block_timestamp,
+                    )
+                }
+
+                error => Err(error),
+            })
             .map_err(|error| Error::ApplyRegularTransaction(Some(transaction.hash), error))?;
 
         // Update transaction.
@@ -310,4 +341,139 @@ pub enum Error {
 fn stringify_hash(hash: &Option<TransactionHash>) -> String {
     hash.map(|hash| hash.to_string())
         .unwrap_or_else(|| "<hash unavailable>".to_string())
+}
+
+#[cfg(all(test, feature = "standalone"))]
+mod tests {
+    use crate::domain::{LedgerState, Transaction, node};
+    use anyhow::Context;
+    use indexer_common::{
+        domain::{BlockHash, ProtocolVersion, SerializedTransaction, TransactionHash, ledger},
+        error::BoxError,
+        infra::{
+            ledger_db, migrations,
+            pool::{self, sqlite::SqlitePool},
+        },
+    };
+    use std::{error::Error as StdError, fs, iter};
+
+    // Mainnet block 1788980's first (and only) regular transaction: parent 1784643552, block
+    // 1784643558, intent TTL 1784643562. The node accepted it at block time; the bumped `tblock`
+    // 1784643564 is past the TTL. Fixture from midnightntwrk/midnight-indexer#1610.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mainnet_1788980_ttl_between_the_tblocks_is_accepted() -> Result<(), BoxError> {
+        let _temp_dir = init_ledger_db().await?;
+        let error = apply_one(
+            "mainnet",
+            ProtocolVersion::V1_0(1_000_000),
+            "block_1788980_tx.raw",
+            "e769b82781bbfd1e29d602a17916abe6e967ef023eb94d23a4aa8b88a6e35c0a",
+            1_784_643_558,
+            1_784_643_552,
+        )?;
+
+        // Against a fresh state instead of mainnet's, the transaction passes the time checks and
+        // fails the next stateful check: the contract it calls does not exist.
+        assert!(error.contains("call to non-existant contract"), "{error}");
+        Ok(())
+    }
+
+    // Preprod block 164460's first (and only) regular transaction: parent 1775081610, block
+    // 1775081616, intent TTL 1775081620; the bumped `tblock` 1775081622 is past the TTL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preprod_164460_ttl_between_the_tblocks_is_accepted() -> Result<(), BoxError> {
+        let _temp_dir = init_ledger_db().await?;
+        let error = apply_one(
+            "preprod",
+            ProtocolVersion::V0_22(22_000),
+            "block_164460_tx.raw",
+            "6a1005eecf695a8f950e8f8e74de0c6336daf55448326bf0db0b3b55c089ad0b",
+            1_775_081_616,
+            1_775_081_610,
+        )?;
+
+        assert!(error.contains("call to non-existant contract"), "{error}");
+        Ok(())
+    }
+
+    // Applies one fixture transaction as the first regular transaction of a block, with the bump,
+    // to a fresh ledger state and returns the rejection error. Times are in seconds.
+    fn apply_one(
+        network_id: &str,
+        protocol_version: ProtocolVersion,
+        file_name: &str,
+        hash: &str,
+        block_time: u64,
+        parent_block_time: u64,
+    ) -> Result<String, BoxError> {
+        let ledger_version = protocol_version.ledger_version();
+        let raw: SerializedTransaction = fs::read(format!(
+            "{}/../indexer-common/tests/{file_name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))?
+        .into();
+        let transaction = ledger::Transaction::deserialize(&raw, ledger_version)?;
+        assert_eq!(transaction.hash(), TransactionHash::from_hex(hash)?);
+
+        let transaction = node::Transaction::Regular(node::RegularTransaction {
+            hash: transaction.hash(),
+            protocol_version,
+            identifiers: transaction.identifiers()?,
+            raw,
+            contract_actions: vec![],
+        });
+
+        let mut ledger_state = LedgerState::new(network_id.try_into()?, ledger_version)?;
+        match ledger_state.apply_transactions(
+            [transaction],
+            BlockHash::from([0; 32]),
+            block_time * 1_000,
+            parent_block_time * 1_000,
+            true,
+        ) {
+            Ok((transactions, _)) => Err(format!(
+                "expected a rejection, got {:?}",
+                transactions
+                    .iter()
+                    .filter_map(|transaction| match transaction {
+                        Transaction::Regular(transaction) => Some(&transaction.transaction_result),
+                        Transaction::System(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .into()),
+            // Include the source chain: the ledger's reason is in the sources.
+            Err(error) => {
+                Ok(
+                    iter::successors(Some(&error as &dyn StdError), |&error| error.source())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(": "),
+                )
+            }
+        }
+    }
+
+    async fn init_ledger_db() -> Result<tempfile::TempDir, BoxError> {
+        let temp_dir = tempfile::tempdir().context("create tempdir")?;
+        let pool = SqlitePool::new(pool::sqlite::Config {
+            cnn_url: temp_dir.path().join("indexer.sqlite").display().to_string(),
+        })
+        .await
+        .context("create pool")?;
+        migrations::sqlite::run(&pool)
+            .await
+            .context("run migrations")?;
+        ledger_db::init(ledger_db::Config {
+            cache_size: 1_024,
+            cnn_url: temp_dir
+                .path()
+                .join("ledger-db.sqlite")
+                .display()
+                .to_string(),
+        })
+        .await
+        .context("init ledger DB")?;
+        Ok(temp_dir)
+    }
 }
