@@ -14,10 +14,10 @@
 use crate::{
     domain::{
         ApplyRegularTransactionOutcome, ApplySystemTransactionOutcome, ByteArray, ByteVec,
-        IntentHash, LedgerEvent, LedgerVersion, NetworkId, Nonce, SerializedContractAddress,
-        SerializedLedgerParameters, SerializedLedgerStateKey, SerializedTransaction,
-        SerializedZswapMerkleTreeRoot, SerializedZswapState, TokenType, TransactionResult,
-        UnshieldedUtxo,
+        ContractBalance, IntentHash, LedgerEvent, LedgerVersion, NetworkId, Nonce,
+        SerializedContractAddress, SerializedLedgerParameters, SerializedLedgerStateKey,
+        SerializedTransaction, SerializedZswapMerkleTreeRoot, SerializedZswapState, TokenType,
+        TransactionResult, UnshieldedUtxo,
         dust::{self},
         ledger::{Error, IntentV8, SerializableExt, TaggedSerializableExt, TransactionV8},
     },
@@ -435,6 +435,29 @@ impl LedgerState {
                 contract_zswap_state
                     .tagged_serialize()
                     .map_err(|error| Error::Serialize("ZswapStateV8", error))
+            }
+        }
+    }
+
+    /// The token balances of the contract at `address` as held by this ledger state, or `None` if
+    /// the ledger state holds no such contract. Reads the contract state already in the ledger
+    /// state, so unlike deserializing a contract state fetched from the node it does not rebuild a
+    /// large state node by node.
+    #[trace(properties = { "address": "{address}" })]
+    pub fn contract_balances(
+        &self,
+        address: &SerializedContractAddress,
+    ) -> Result<Option<Vec<ContractBalance>>, Error> {
+        match self {
+            Self::V8 { ledger_state, .. } => {
+                let address = ContractAddressV8::deserialize(&mut address.as_ref(), 0)
+                    .map_err(|error| Error::Deserialize("ContractAddressV8", error))?;
+
+                ledger_state
+                    .contract
+                    .get(&address)
+                    .map(super::contract_state::balances_v3)
+                    .transpose()
             }
         }
     }

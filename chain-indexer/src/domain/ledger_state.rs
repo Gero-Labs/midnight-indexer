@@ -20,13 +20,22 @@ use indexer_common::domain::{
     TransactionResult,
     ledger::{self, LedgerParameters},
 };
-use log::warn;
-use std::ops::DerefMut;
+use log::{error, warn};
+use std::{
+    ops::DerefMut,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use thiserror::Error;
 
 /// The node bumps a mempool transaction's well-formed `tblock` two slots (2 × 6s) ahead of the
 /// parent block time; reproduce that same offset here. See `apply_transactions`.
 const MEMPOOL_TBLOCK_BUMP_MILLIS: u64 = 2 * 6_000;
+
+/// Every this many contract actions, `extract_balances` cross-checks the ledger-state balances
+/// against the ones from deserializing the node's state.
+const BALANCE_CHECK_INTERVAL: u64 = 64;
+
+static BALANCE_CHECKS: AtomicU64 = AtomicU64::new(0);
 
 /// New type for ledger state from indexer_common.
 #[derive(Debug, Clone, From, Deref)]
@@ -134,7 +143,87 @@ impl LedgerState {
             .finalize_apply_transactions(block_timestamp)
             .map_err(Error::PostApplyTransactions)?;
 
+        // A contract action's `state` is fetched from the node at this block's hash, i.e. it is the
+        // contract's state at the end of the block. Its balances are taken from the same state as
+        // held by this ledger state, now that the whole block is applied, instead of deserializing
+        // `state`: rebuilding a large state node by node cost ~8s per action on mainnet (a ~800 kB
+        // contract state, 2026-10-03).
+        let mut transactions = transactions;
+        for transaction in transactions.iter_mut() {
+            if let Transaction::Regular(transaction) = transaction {
+                self.extract_balances(transaction)?;
+            }
+        }
+
         Ok((transactions, ledger_parameters))
+    }
+
+    /// Set the balances of `transaction`'s contract actions from the contract states held by this
+    /// ledger state.
+    fn extract_balances(&self, transaction: &mut RegularTransaction) -> Result<(), Error> {
+        let hash = transaction.hash;
+        let ledger_version = transaction.protocol_version.ledger_version();
+
+        for contract_action in transaction.contract_actions.iter_mut() {
+            // TODO: Workaround until we filter failed contract actions (empty state means failed).
+            if contract_action.state.is_empty() {
+                continue;
+            }
+
+            let balances = self
+                .0
+                .contract_balances(&contract_action.address)
+                .map_err(|error| {
+                    Error::GetContractBalances(hash, contract_action.address.clone(), error)
+                })?;
+
+            let from_node_state = || {
+                ledger::ContractState::deserialize(&contract_action.state, ledger_version)
+                    .map_err(|error| {
+                        Error::DeserializeContractState(
+                            hash,
+                            contract_action.address.clone(),
+                            error,
+                        )
+                    })?
+                    .balances()
+                    .map_err(|error| {
+                        Error::GetContractBalances(hash, contract_action.address.clone(), error)
+                    })
+            };
+
+            contract_action.extracted_balances = match balances {
+                // Self-check: for every BALANCE_CHECK_INTERVAL-th action also take the balances the
+                // old way. On a mismatch log it and keep the node-derived ones.
+                Some(balances)
+                    if BALANCE_CHECKS
+                        .fetch_add(1, Ordering::Relaxed)
+                        .is_multiple_of(BALANCE_CHECK_INTERVAL) =>
+                {
+                    let expected = from_node_state()?;
+                    if balances == expected {
+                        balances
+                    } else {
+                        error!(
+                            transaction_hash:% = hash,
+                            address:% = const_hex::encode(&contract_action.address),
+                            ledger_balances:? = balances,
+                            node_balances:? = expected;
+                            "contract balances from the ledger state differ from the node's state"
+                        );
+                        expected
+                    }
+                }
+
+                Some(balances) => balances,
+
+                // The node returned a state, so the ledger state should hold the contract too;
+                // if it does not, fall back to deserializing the node's state.
+                None => from_node_state()?,
+            };
+        }
+
+        Ok(())
     }
 
     /// The highest used zswap state index or none.
@@ -228,28 +317,7 @@ impl LedgerState {
                 .map_err(|error| Error::ExtractContractZswapState(transaction.hash, error))?;
             contract_action.zswap_state = zswap_state;
 
-            // TODO: Workaround until we filter failed contract actions (empty state means failed).
-            if !contract_action.state.is_empty() {
-                let contract_state = ledger::ContractState::deserialize(
-                    &contract_action.state,
-                    transaction.protocol_version.ledger_version(),
-                )
-                .map_err(|error| {
-                    Error::DeserializeContractState(
-                        transaction.hash,
-                        contract_action.address.clone(),
-                        error,
-                    )
-                })?;
-                let balances = contract_state.balances().map_err(|error| {
-                    Error::GetContractBalances(
-                        transaction.hash,
-                        contract_action.address.clone(),
-                        error,
-                    )
-                })?;
-                contract_action.extracted_balances = balances;
-            }
+            // Balances are set in `extract_balances` once the whole block is applied.
         }
 
         Ok(Transaction::Regular(transaction.into()))
